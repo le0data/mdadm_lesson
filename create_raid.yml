@@ -1,0 +1,77 @@
+---
+- name: Настройка RAID1 на Ubuntu
+  hosts: all
+  become: yes
+  tasks:
+    -  name: Установка утилиты mdadm
+       apt:
+         name: mdadm
+         state: present
+         update_cache: yes
+    
+    - name: Проверка доступных дисков
+      command: lsblk -d -n -o NAME
+      register: disks
+    
+    - name: Отфильтровать диски без разделов
+      shell: |
+        lsblk -d -n -o NAME | while read disk; do
+          if [ -z "$(lsblk /dev/$disk -n -o PARTTYPE)" ]; then
+            echo /dev/$disk
+          fi
+        done
+      register: available_disks
+      changed_when: false
+    
+    - name: Вывести отфильтрованные диски
+      debug:
+        var: available_disks.stdout_lines
+
+    - name: Проверка, что доступно минимум 2 диска
+      fail:
+        msg: "Недостаточно дисков для создания RAID1. Нужно минимум 2 диска."
+      when: available_disks.stdout_lines | length < 2
+
+    - name: Создать RAID1
+      command: >
+        mdadm --create --verbose /dev/md127 -l 1 -n 2
+        --metadata=0.90 --force
+        {{ available_disks.stdout_lines[:2] | join(' ') }}
+      args:
+        creates: /dev/md127
+
+    - name: Проверить, что RAID создан
+      command: mdadm --detail /dev/md127
+      register: raid_status
+      failed_when: "'/dev/md127' not in raid_status.stdout"
+    
+    - name: Сохранить конфигурацию RAID в mdadm.conf
+      shell: mdadm --detail --scan >> /etc/mdadm/mdadm.conf
+      args:
+        creates: /etc/mdadm/mdadm.conf
+
+    - name: Обновить initramfs
+      command: update-initramfs -u
+
+    - name: Создание файловой системы на RAID
+      filesystem:
+        fstype: ext4
+        dev: /dev/md127
+
+    - name: Создание точки монтирования
+      file:
+        path: /mnt/raid1
+        state: directory
+
+    - name: Смонтировать RAID
+      mount:
+        path: /mnt/raid1
+        src: /dev/md127
+        fstype: ext4
+        state: mounted
+
+    - name: Автоматическое монтирование при старте системы
+      lineinfile:
+        path: /etc/fstab
+        line: "/dev/md127 /mnt/raid1 ext4 defaults 0 0"
+        state: present
